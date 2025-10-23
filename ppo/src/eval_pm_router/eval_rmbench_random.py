@@ -1,0 +1,757 @@
+import torch
+from typing import List, Tuple
+from datasets import load_dataset
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from collections import defaultdict
+import argparse
+import matplotlib.pyplot as plt
+import seaborn as sns
+import json
+from openrlhf.utils import get_tokenizer
+from openrlhf.models import get_llm_for_sequence_regression
+from tqdm import tqdm
+import os
+from typing import List, Dict, Any
+from openrlhf.utils.rmbench_utils import compute_accuracy, save_intermediate_results, load_intermediate_results
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
+
+import boto3
+from botocore.config import Config
+import re
+from botocore.exceptions import ClientError
+import random
+import time
+from multiprocessing import Pool
+
+# threshold = 1.45
+
+
+def plot_accuracy_vs_uncertainty(reward_diff, uncertainties, save_path="accuracy_vs_uncertainty.pdf"):
+    """
+    Creates a plot showing the relationship between prediction accuracy and uncertainty.
+    """
+    plt.figure(figsize=(5, 3))
+    
+    # Convert inputs to numpy arrays
+    reward_diff = np.array(reward_diff)
+    uncertainties = np.array(uncertainties)
+    print('uncertainty', uncertainties.mean())
+    np.savez('rmbench.npz', reward_diff=reward_diff, uncertainties=uncertainties)
+    
+    # Calculate correctness (1 if reward_diff >= 0, 0 otherwise)
+    correct = (reward_diff >= 0).astype(int)
+    
+    # Create uncertainty bins
+    n_bins = 10
+    uncertainty_bins = np.percentile(uncertainties, np.linspace(0, 100, n_bins+1))
+    
+    bin_accuracies = []
+    bin_mean_uncertainties = []
+    bin_counts = []
+    bin_std_accuracies = []
+    
+    # Calculate accuracy for each uncertainty bin
+    for i in range(len(uncertainty_bins)-1):
+        mask = (uncertainties >= uncertainty_bins[i]) & (uncertainties < uncertainty_bins[i+1])
+        if np.sum(mask) > 0:
+            bin_accuracies.append(np.mean(correct[mask]))
+            bin_mean_uncertainties.append(np.mean(uncertainties[mask]))
+            bin_counts.append(np.sum(mask))
+            bin_std_accuracies.append(np.std(correct[mask]) / np.sqrt(np.sum(mask)))
+    
+    bin_accuracies = np.array(bin_accuracies)
+    bin_mean_uncertainties = np.array(bin_mean_uncertainties)
+    bin_counts = np.array(bin_counts)
+    bin_std_accuracies = np.array(bin_std_accuracies)
+    
+    # Create the plot
+    plt.errorbar(bin_mean_uncertainties, bin_accuracies, 
+                yerr=bin_std_accuracies, 
+                fmt='o-', 
+                capsize=5,
+                markersize=8,
+                label='Accuracy per uncertainty bin')
+    
+    # Size of points proportional to number of samples
+    sizes = 100 * bin_counts / np.max(bin_counts)
+    plt.scatter(bin_mean_uncertainties, bin_accuracies, 
+               s=sizes, 
+               alpha=0.5)
+    
+    plt.xlabel('Uncertainty')
+    plt.ylabel('Accuracy')
+    # plt.title('Accuracy vs. Uncertainty')
+    plt.grid(True, alpha=0.3)
+    
+    # Add correlation coefficient
+    correlation = np.corrcoef(uncertainties, correct)[0,1]
+    plt.text(0.05, 0.05, f'RMBench Correlation: {correlation:.3f}', 
+             transform=plt.gca().transAxes,
+             bbox=dict(facecolor='white', alpha=0.8))
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    return correlation
+
+class RMBenchDataset(Dataset):
+    def __init__(self, dataset, tokenizer, model_type="reward"):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.model_type = model_type
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        prompt = item['prompt']
+        chosen = item['chosen']
+        rejected = item['rejected']
+        domain = item['domain']
+
+        if self.model_type == "reward":
+            return None
+            # TODO
+            chosen_text = self.tokenizer.apply_chat_template([
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": chosen}
+            ], tokenize=False)
+            
+            rejected_text = self.tokenizer.apply_chat_template([
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": rejected}
+            ], tokenize=False)
+
+            return {
+                'chosen_text': chosen_text,
+                'rejected_text': rejected_text,
+                'subset': subset
+            }
+        else:  # preference model
+            texts_1 = []
+            texts_2 = []
+            prompts = []
+            resps_1 = []
+            resps_2 = []
+            for i in range(3):      # chosen idx
+                for j in range(3):  # rejected idx
+                    texts_1.append(
+                        self.tokenizer.apply_chat_template([
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant_1", "content": chosen[i]},
+                        {"role": "assistant_2", "content": rejected[j]},
+                    ], tokenize=False)
+                    )
+                    texts_2.append(
+                        self.tokenizer.apply_chat_template([
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant_1", "content": rejected[j]},
+                        {"role": "assistant_2", "content": chosen[i]},
+                    ], tokenize=False)
+                    )
+                    prompts.append(prompt)
+                    resps_1.append(chosen[i])
+                    resps_2.append(rejected[j])
+
+            return {
+                'texts_1': texts_1,
+                'texts_2': texts_2,
+                'domain': domain,
+                'prompts': prompts,
+                'resps_1': resps_1,
+                'resps_2': resps_2,
+            }
+
+def get_deepseek_r1_response(message):
+    if len(message) == 4:
+        prompt, response_1, response_2, region_seed = message
+    else:
+        prompt, response_1, response_2 = message
+        region_seed = random.randint(0, 1)
+    # query = f"You are an impartial judge. Here is the context of a conversation between user and assistant: {prompt}.\nPlease compare the responses given by assistant_1 and assistant_2 and decide which one is better.\nAssistant_1: {response_1}\nAssistant_2: {response_2}\nYour answer should be put in <label></label>, 1 indicates assistant_1 is better, 2 indicates assistant_2 is better, 3 indicates they are both good or both bad and you really could not decide which one is better. Please do not let the display order affect your judgement."
+    
+    query = (
+        "You are an impartial judge, tasked with evaluating the quality of the two AI assistants' responses to the context displayed below. "
+        "Your evaluation should be based on the following six criteria:\n\n"
+        "- Helpfulness: Overall helpfulness of the response to the user's question or instruction.\n"
+        "- Correctness: Inclusion of all pertinent facts without errors.\n"
+        "- Coherence: Consistency and clarity of expression.\n"
+        "- Complexity: Intellectual depth required to write response (i.e., whether the response can be written by anyone with basic language competency or requires deep domain expertise).\n"
+        "- Verbosity: Amount of detail included in the response, relative to what is asked for in the context.\n"
+        "- Safety: Whether the response is free of any kind of harmful, toxic, or illegal content.\n\n"
+        "After carefully considering these criteria, determine which assistant's response is superior. "
+        # "Begin your evaluation by thinking through the problem step by step if the answer is not obvious to you. "
+        "Output your final verdict by strictly following this format: "
+        "<label>1</label> if assistant A is better, <label>2</label> if assistant B is better, and <label>0</label> only if you really cannot tell their difference."
+        "[The Start of Context]\n"
+        "{prompt}\n"
+        "[The End of Context]\n\n"
+        "[The Start of Assistant A's Response]\n"
+        "{response_1}\n"
+        "[The End of Assistant A's Response]\n\n"
+        "[The Start of Assistant B's Response]\n"
+        "{response_2}\n"
+        "[The End of Assistant B's Response]"
+    ).format(prompt=prompt, response_1=response_1, response_2=response_2)
+    # print(query)
+
+    formatted_prompt = f"""
+    <｜begin▁of▁sentence｜><｜User｜>{query}<｜Assistant｜><think>\n
+    """
+
+    body = json.dumps({
+        "prompt": formatted_prompt,
+        "max_tokens": 2048,
+        "temperature": 0.6,
+        "top_p": 0.9,
+    })
+
+    try:
+        regions = ["us-east-1", "us-west-2"]
+        config = Config(
+            retries={
+                'total_max_attempts': 60, 
+                'mode': 'standard'
+            }
+        )
+        client = boto3.client("bedrock-runtime", region_name=regions[region_seed % 2], config=config)
+        client_model_id = "us.deepseek.r1-v1:0"
+        response = client.invoke_model(modelId="us.deepseek.r1-v1:0", body=body)
+        
+        model_response = json.loads(response["body"].read())
+        response = model_response["choices"][0]['text']
+        
+        label = extract_label(response)
+        client.close()
+        if label == 1:
+            return 2.0
+        elif label == 2:
+            return -2.0
+        elif label == 0:
+            return 0.0
+        return None
+    
+    except (ClientError, Exception) as e:
+        print(f"ERROR: Can't invoke '{client_model_id}'. Reason: {e}")
+        with open("/workspace/log.txt", "a") as file:
+            file.write(f"ERROR: Can't invoke '{client_model_id}'. Reason: {e}\n")
+        return None
+
+class RewardModelEvaluator:
+    def __init__(self, 
+                model_path: str, 
+                batch_size: int = 8, 
+                value_head_prefix: str = "value_head", 
+                model_type: str = "reward", 
+                use_sn: bool = False,
+                sn_range: float = 10.,
+                use_gp: bool = False,
+                gp_amplitude: float = 0.1,
+                use_mcd: bool = False,
+                mcd_p: float = 0.2,
+                local_rank: int = -1,
+                router: str = "threshold",
+                aggregate: str = "mean",
+        ):
+        self.local_rank = local_rank
+        if local_rank != -1:
+            torch.cuda.set_device(local_rank)
+        self.device = torch.device(f"cuda:{local_rank}" if local_rank != -1 else "cuda")
+        print(self.local_rank, '>>>>>>', self.device)
+        
+        self.model = get_llm_for_sequence_regression(
+            model_path, model_type, bf16=True, use_flash_attention_2=True,
+            value_head_prefix=value_head_prefix, use_sn=use_sn, sn_range=sn_range, use_gp=use_gp,
+            gp_amplitude=gp_amplitude, use_mcd=use_mcd, mcd_p=mcd_p
+        ).to(self.device)
+        
+        if local_rank != -1:
+            self.model = DDP(self.model, device_ids=[local_rank])
+        
+        self.tokenizer = get_tokenizer(model_path, self.model, "left", None, use_fast=True)
+        self.batch_size = batch_size
+        self.model_type = model_type
+        if use_mcd:
+            self.model.train()
+        else:
+            self.model.eval()
+
+        self.router = router
+        self.aggregate = aggregate
+
+    def collate_fn(self, batch):
+        if self.model_type == "reward":
+            return None
+            chosen_texts = [item['chosen_text'] for item in batch]
+            rejected_texts = [item['rejected_text'] for item in batch]
+            subsets = [item['subset'] for item in batch]
+
+            chosen_inputs = self.tokenizer(
+                chosen_texts, return_tensors="pt", padding=True,
+                truncation=True, max_length=8192
+            )
+            rejected_inputs = self.tokenizer(
+                rejected_texts, return_tensors="pt", padding=True,
+                truncation=True, max_length=8192
+            )
+
+            return {
+                'chosen_inputs': chosen_inputs,
+                'rejected_inputs': rejected_inputs,
+                'subsets': subsets
+            }
+        else:
+            # print(type(batch[0]['texts_1']))
+            # print(len(batch[0]['texts_1']))
+            texts_1 = sum([item['texts_1'] for item in batch], [])  # (9B,)
+            texts_2 = sum([item['texts_2'] for item in batch], [])  # (9B,)
+            domains = [item['domain'] for item in batch]            # (B,)
+            prompts = sum([item['prompts'] for item in batch], [])
+            resps_1 = sum([item['resps_1'] for item in batch], [])
+            resps_2 = sum([item['resps_2'] for item in batch], [])
+
+            inputs_1 = self.tokenizer(
+                texts_1, return_tensors="pt", padding=True,
+                truncation=True, max_length=8192
+            )
+            inputs_2 = self.tokenizer(
+                texts_2, return_tensors="pt", padding=True,
+                truncation=True, max_length=8192
+            )
+
+            return {
+                'inputs_1': inputs_1,
+                'inputs_2': inputs_2,
+                'domains': domains,
+                'prompts': prompts,
+                'resps_1': resps_1,
+                'resps_2': resps_2,
+            }
+
+    def evaluate_batch(self, batch):
+        with torch.no_grad():
+            if self.model_type == "reward":
+                return None
+            else:
+                inputs_1 = {k: v.to(self.device) for k, v in batch['inputs_1'].items()}
+                inputs_2 = {k: v.to(self.device) for k, v in batch['inputs_2'].items()}
+                
+                if isinstance(self.model, DDP):
+                    model = self.model.module
+                else:
+                    model = self.model
+                    
+                scores_1, var_1 = model.predict(
+                    inputs_1['input_ids'],
+                    inputs_1['attention_mask']
+                )
+                scores_2, var_2 = model.predict(
+                    inputs_2['input_ids'],
+                    inputs_2['attention_mask']
+                )
+                # Average the uncertainties from both directions
+                if self.aggregate in ["minimum", "min"]: 
+                    uncertainties = torch.minimum(var_1, var_2)
+                elif self.aggregate in ["maximum", "max"]:
+                    uncertainties = torch.maximum(var_1, var_2)
+                elif self.aggregate in ["mean", "average"]:
+                    uncertainties = (var_1 + var_2) / 2
+                # return torch.stack([scores_1, scores_2]).cpu(), batch['domains'], torch.stack([var_1, var_2]).cpu()
+                return ((scores_1 - scores_2) / 2).cpu(), batch['domains'], uncertainties.cpu()
+
+def extract_label(text):
+    match = re.search(r'<label>(.*?)</label>', text)
+    if match:
+        content = match.group(1)
+        if content in ['1', '2']:
+            return int(content)
+    return 0 
+
+# Add this function to create and save the plots
+def create_calibration_plot(reward_diff, n_bins=10):
+    """
+    Creates a calibration plot comparing predicted probability (based on score difference)
+    to observed accuracy, ensuring probabilities are always >= 0.5
+    """
+    score_diffs = np.array(reward_diff)
+    
+    # Convert score differences to probabilities using sigmoid and ensure >= 0.5
+    raw_probs = 1 / (1 + np.exp(-score_diffs))
+    probs = np.where(score_diffs >= 0, raw_probs, 1 - raw_probs)
+    
+    # Actual correctness (1 if chosen > rejected, 0 otherwise)
+    correct = (score_diffs >= 0).astype(int)
+    
+    # Calculate calibration curve with bins from 0.5 to 1.0
+    bin_edges = np.linspace(0.5, 1.0, n_bins + 1)
+    bin_indices = np.digitize(probs, bin_edges) - 1
+    
+    bin_accuracies = []
+    bin_confidences = []
+    bin_counts = []
+    
+    for i in range(n_bins):
+        mask = (bin_indices == i)
+        if np.sum(mask) > 0:
+            bin_accuracies.append(np.mean(correct[mask]))
+            bin_confidences.append(np.mean(probs[mask]))
+            bin_counts.append(np.sum(mask))
+    
+    return np.array(bin_confidences), np.array(bin_accuracies), np.array(bin_counts)
+
+def plot_score_distributions(reward_diff, uncertainties=None, save_path="score_distributions.pdf"):
+    plt.figure(figsize=(15, 5))
+    
+    # Convert inputs to numpy arrays if they aren't already
+    reward_diff = np.array(reward_diff)
+    if uncertainties is not None:
+        uncertainties = np.array(uncertainties)
+    
+    # Score differences with uncertainty
+    ax1 = plt.subplot(1, 2, 1)
+    
+    # Plot score differences histogram
+    sns.histplot(data=reward_diff, bins=50, color='blue', alpha=0.6, ax=ax1)
+    ax1.axvline(x=0, color='r', linestyle='--')
+    ax1.set_title('Score Differences\n(Chosen - Rejected)')
+    ax1.set_xlabel('Score Difference')
+    ax1.set_ylabel('Count', color='blue')
+    
+    if uncertainties is not None:
+        # Create bins and compute mean uncertainty for each bin
+        bins = np.histogram_bin_edges(reward_diff, bins=50)
+        bin_indices = np.digitize(reward_diff, bins) - 1
+        mean_uncertainties = []
+        bin_centers = []
+        
+        for i in range(len(bins)-1):
+            mask = (bin_indices == i)
+            if mask.any():  # Changed from np.sum(mask) > 0
+                mean_uncertainties.append(float(np.mean(uncertainties[mask])))
+                bin_centers.append(float((bins[i] + bins[i+1]) / 2))
+        
+        # Convert to numpy arrays
+        mean_uncertainties = np.array(mean_uncertainties)
+        bin_centers = np.array(bin_centers)
+        
+        # Plot mean uncertainty line
+        ax2 = ax1.twinx()
+        ax2.plot(bin_centers, mean_uncertainties, color='red', linewidth=2, label='Mean Uncertainty')
+        ax2.set_ylabel('Uncertainty', color='red')
+        ax2.tick_params(axis='y', labelcolor='red')
+        
+        # Add legend
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+    
+    # Calibration plot
+    plt.subplot(1, 2, 2)
+    conf, acc, counts = create_calibration_plot(reward_diff)
+    plt.plot([0, 1], [0, 1], 'k--', label='Perfect calibration')
+    sizes = 50 * counts / np.max(counts)
+    plt.scatter(conf, acc, s=sizes, alpha=0.6, label='Model calibration')
+    plt.title('Calibration Plot')
+    plt.xlabel('Predicted Probability')
+    plt.ylabel('Observed Accuracy')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    ece = np.average(np.abs(conf - acc), weights=counts)
+    print(f"\nCalibration Metrics:")
+    print(f"Expected Calibration Error (ECE): {ece:.4f}")
+    return ece
+
+def evaluate_on_rmbench(
+        model_path: str, 
+        save_path: str, 
+        batch_size: int = 8, 
+        value_head_prefix: str = "value_head", 
+        model_type: str = "reward", 
+        use_sn: bool = False,
+        sn_range: float = 10.,
+        use_gp: bool = False,
+        gp_amplitude: float = 0.1,
+        use_mcd: bool = False,
+        mcd_p: float = 0.2,
+        n_dropout: int = 3,
+        local_rank: int = -1,
+        router: str = "threshold",
+        aggregate: str = "mean",
+        threshold: float = 1.45
+    ):
+    evaluator = RewardModelEvaluator(
+        model_path, 
+        batch_size, 
+        value_head_prefix, 
+        model_type=model_type, 
+        use_sn=use_sn,
+        sn_range=sn_range,
+        use_gp=use_gp,
+        gp_amplitude=gp_amplitude,
+        use_mcd=use_mcd,
+        mcd_p=mcd_p,
+        local_rank=local_rank,
+        router=router,
+        aggregate=aggregate,
+    )
+
+    if local_rank != -1:
+        print(f"Process {local_rank} using device: {evaluator.device}")
+    
+    # Load dataset
+    dataset = load_dataset("THU-KEG/RM-Bench", split="train")
+    reward_dataset = RMBenchDataset(dataset, evaluator.tokenizer, model_type)
+    
+    # Add DistributedSampler
+    sampler = DistributedSampler(reward_dataset) if local_rank != -1 else None
+    
+    dataloader = DataLoader(
+        reward_dataset, 
+        batch_size=batch_size,
+        collate_fn=evaluator.collate_fn,
+        num_workers=4,
+        pin_memory=True,
+        sampler=sampler,
+        shuffle=(sampler is None)
+    )
+
+    total_diffs = []
+    total_uncertainties = []
+    results = []
+
+    for batch in tqdm(dataloader, disable=(local_rank != 0)):
+        if not use_mcd:
+            reward_diffs, domains, uncertainties = evaluator.evaluate_batch(batch)
+        else:
+            pass
+
+        total_diffs.extend(reward_diffs.flatten().tolist())
+        total_uncertainties.extend(uncertainties.flatten().tolist())
+
+
+    np_uncertainties = np.array(total_uncertainties)
+    cnt = np.count_nonzero(np_uncertainties > threshold)
+    print(f'local rank: {local_rank},\t cnt: {cnt},\t tot: {len(total_uncertainties)}')
+    
+    start_time = time.time()
+    if evaluator.router in ["random", "min", "min_orig", "threshold"]:
+        if evaluator.router == "random":
+            indices = random.sample(range(len(total_uncertainties)), cnt)
+        elif evaluator.router == "min":
+            indices = np.argsort(np.abs(np.array(total_diffs)))[:cnt]
+        elif evaluator.router == "min_orig":
+            indices = np.argsort(np.abs(np.array(total_diffs) * np.array(total_uncertainties)))[:cnt]
+        elif evaluator.router == "threshold":
+            indices = np.argsort(-np_uncertainties)[:cnt]
+            
+        messages = []
+        for j, batch in enumerate(dataloader):
+            lb = j * batch_size * 9
+            rb = lb + len(batch['prompts']) 
+            for idx in indices:
+                if lb <= idx and idx < rb:
+                    k = idx % 9
+                    messages.append((batch['prompts'][k], batch['resps_1'][k], batch['resps_2'][k]))
+                    # print(local_rank, j, batch_size, lb, idx, rb)
+                    # print(f'before >>>>> [{idx}]: {total_diffs[idx]}')
+                    # total_diffs[idx] = evaluator.get_deepseek_r1_response((batch['prompts'][k], batch['resps_1'][k], batch['resps_2'][k]))
+                    # # if (idx // 9) % 2 == 0:
+                    # #     total_diffs[idx] = evaluator.get_deepseek_r1_response((batch['prompts'][k], batch['resps_1'][k], batch['resps_2'][k]))
+                    # # else:
+                    # #     total_diffs[idx] = evaluator.get_deepseek_r1_response((batch['prompts'][k], batch['resps_2'][k], batch['resps_1'][k]))
+                    # print(f'after >>>>> [{idx}]: {total_diffs[idx]}')
+        num_processes = 8  # Adjust based on your needs and system capabilities
+            
+        with Pool(processes=num_processes) as pool:
+            r1_results = list(tqdm(pool.imap(get_deepseek_r1_response, messages), total=len(messages), desc=f"Rank:{local_rank}"))
+        
+        messages_idx = 0
+        for j, batch in enumerate(dataloader):
+            lb = j * batch_size * 9
+            rb = lb + len(batch['prompts']) 
+            for idx in indices:
+                if lb <= idx and idx < rb:
+                    total_diffs[idx] = r1_results[messages_idx]
+                    messages_idx += 1
+    # total_diffs = np.array(total_diffs).reshape(-1, 9)
+    # total_diffs = ((total_diffs[0::2,:] - total_diffs[1::2,:]) / 2).flatten().tolist()
+    # total_uncertainties = np.array(total_uncertainties).reshape(-1, 9)
+    # total_uncertainties = np.min(np.stack([total_uncertainties[0::2,:], total_uncertainties[1::2,:]]), axis=0).flatten().tolist()
+    print(f"local rank {local_rank} --- {time.time()-start_time} seconds ---")
+
+    for j, batch in enumerate(dataloader):
+        lb = j*batch_size*9
+        reward_diffs = np.array(total_diffs[lb : lb+len(batch['prompts'])])
+        uncertainties = np.array(total_uncertainties[lb : lb+len(batch['prompts'])])
+        domains = batch['domains']
+        for i in range(len(domains)):
+            results.append({
+                "domain": domains[i],
+                "reward_diff": reward_diffs[9*i:9*(i+1)].reshape(3, 3),
+                "uncertainty": uncertainties[9*i:9*(i+1)].reshape(3, 3)
+            })
+
+    # Gather results from all processes
+    if local_rank != -1:
+        world_size = dist.get_world_size()
+        
+        all_results = [None] * world_size
+        all_total_diffs = [None] * world_size
+        all_total_uncertainties = [None] * world_size
+        
+        dist.all_gather_object(all_results, results)
+        dist.all_gather_object(all_total_diffs, total_diffs)
+        dist.all_gather_object(all_total_uncertainties, total_uncertainties)
+        
+        if local_rank == 0:
+            results = sum(all_results, [])
+            total_diffs = sum(all_total_diffs, [])
+            total_uncertainties = sum(all_total_uncertainties, [])
+    
+    if local_rank == 0 or local_rank == -1:
+        os.makedirs(save_path, exist_ok=True)
+        
+        # Verify the lengths match
+        n_comparisons = len(results) * 9  # Each result has 9 comparisons
+        assert len(total_diffs) == n_comparisons, f"Mismatch in data sizes: {len(total_diffs)} total_diffs vs {n_comparisons} expected from results"
+        
+        # Save intermediate results
+        save_intermediate_results(save_path, results, total_diffs)
+            
+        final_results = compute_accuracy(results, model_type=model_type)
+        ece = plot_score_distributions(total_diffs, uncertainties=total_uncertainties, save_path=os.path.join(save_path, 'score_distributions_rmbench.pdf'))
+        final_results['ece'] = ece
+
+        # Add accuracy vs uncertainty plot
+        correlation = plot_accuracy_vs_uncertainty(
+            total_diffs, 
+            total_uncertainties, 
+            save_path=os.path.join(save_path, 'accuracy_vs_uncertainty_rmbench.pdf')
+        )
+        final_results['uncertainty_correlation'] = correlation
+        
+        # Add size information to final_results
+        final_results['total_samples'] = len(total_diffs)
+        final_results['total_prompts'] = len(results)
+        
+        with open(os.path.join(save_path, 'rmbench.json'), "w") as f:
+            json.dump(final_results, f)
+        return final_results
+    return None
+
+def plot_from_saved_results(results_dir: str):
+    """
+    Create plots from saved intermediate results without running evaluation again.
+    """
+    try:
+        # Load intermediate results
+        total_diffs, results = load_intermediate_results(results_dir)
+        final_diffs = np.stack([x['reward_diff'] for x in results]).flatten()
+        final_uncertainties = np.stack([x['uncertainty'] for x in results]).flatten()
+        
+        final_results = compute_accuracy(results, model_type="preference")
+        ece = plot_score_distributions(
+            final_diffs, 
+            uncertainties=final_uncertainties,
+            save_path=os.path.join(results_dir, 'score_distributions_rmbench_replot.pdf')
+        )
+        correlation = plot_accuracy_vs_uncertainty(
+            final_diffs,
+            final_uncertainties,
+            save_path=os.path.join(results_dir, 'accuracy_vs_uncertainty_rmbench_replot.pdf')
+        )
+        
+        final_results['ece'] = ece
+        final_results['uncertainty_correlation'] = correlation
+        print("Final Results:", final_results)
+        
+        return final_results
+    except Exception as e:
+        print(f"Error loading or plotting results: {str(e)}")
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Evaluate reward models on RMBench')
+    parser.add_argument('--model_path', type=str, required=True,
+                      help='Path to the reward model')
+    parser.add_argument('--save_path', type=str, default='./eval_results/rmbench',
+                      help='Path to the reward model')
+    parser.add_argument('--batch_size', type=int, default=8,
+                      help='Batch size for evaluation')
+    parser.add_argument('--value_head_prefix', type=str, default="value_head",
+                      help='Prefix for the value head in the model')
+    parser.add_argument('--model_type', type=str, default="reward",
+                      help='Model type, reward or preference')
+    parser.add_argument("--use_sn", action="store_true", default=False, help="Enable Spectral Normalization")
+    parser.add_argument("--sn_range", type=float, default=10., help="Spectral Normalization Range")
+    parser.add_argument("--use_gp", action="store_true", default=False, help="Enable Gaussian Process")
+    parser.add_argument("--gp_amplitude", type=float, default=0.1, help="Gaussian Process Amplitude")
+    parser.add_argument("--use_mcd", action="store_true", default=False, help="Enable MC Dropout")
+    parser.add_argument("--mcd_p", type=float, default=0.2, help="MC Dropout rate")
+    parser.add_argument('--n_dropout', type=int, default=3,
+                      help='MC dropout count')
+    parser.add_argument('--plot_only', action='store_true',
+                      help='Only create plots from saved results without running evaluation')
+    parser.add_argument('--router', type=str, default="threshold")
+    parser.add_argument('--aggregate', type=str, default="mean")
+    parser.add_argument('--threshold', type=float, default=1.45)
+    
+    
+    # parser.add_argument("--local_rank", type=int, default=-1,
+    #                     help="Local rank for distributed training")
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    
+    args = parser.parse_args()
+    
+    if args.plot_only:
+        results = plot_from_saved_results(args.save_path)
+        print("Plots created from saved results")
+        return
+    
+    import datetime
+
+    timeout_seconds = 3600
+    timeout_duration = datetime.timedelta(seconds=timeout_seconds)
+    if local_rank != -1:
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", timeout=timeout_duration)
+    
+    results = evaluate_on_rmbench(
+        model_path=args.model_path,
+        save_path=args.save_path,
+        batch_size=args.batch_size,
+        value_head_prefix=args.value_head_prefix,
+        model_type=args.model_type,
+        use_sn=args.use_sn,
+        sn_range=args.sn_range,
+        use_gp=args.use_gp,
+        gp_amplitude=args.gp_amplitude,
+        use_mcd=args.use_mcd,
+        mcd_p=args.mcd_p,
+        n_dropout=args.n_dropout,
+        local_rank=local_rank,
+        router=args.router,
+        aggregate=args.aggregate,
+        threshold=args.threshold,
+    )
+    
+    if local_rank <= 0:  # Print only on main process or single GPU
+        print(results)
+
+    if local_rank != -1:
+        dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()
